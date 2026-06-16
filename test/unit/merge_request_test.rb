@@ -1,7 +1,7 @@
 require File.expand_path('../../test_helper', __FILE__)
 
 class MergeRequestTest < ActiveSupport::TestCase
-  fixtures :issues
+  fixtures :all
 
   def test_updates_issues_from_description
     issue = Issue.last
@@ -96,5 +96,55 @@ class MergeRequestTest < ActiveSupport::TestCase
 
     assert_includes(MergeRequest.find_all_by_issue(issue), merge_request)
     refute_includes(MergeRequest.find_all_by_issue(issue), other_merge_request)
+  end
+
+  def test_transitioned_issues_is_populated_on_merge_with_keyword
+    issue = Issue.find(1)
+
+    with_merge_status_env do
+      merge_request =
+        MergeRequest.create!(title: "resolves ##{issue.id}", state: 'merged')
+
+      assert_includes(merge_request.transitioned_issues, issue)
+      journal = merge_request.transitioned_issues.first.current_journal
+      assert(journal.present? && journal.persisted?,
+             'expected a persisted journal recording the status change')
+    end
+  end
+
+  def test_transitioned_issues_is_empty_when_not_merged
+    issue = Issue.find(1)
+
+    with_merge_status_env do
+      merge_request =
+        MergeRequest.create!(title: "resolves ##{issue.id}", state: 'opened')
+
+      assert_equal([], merge_request.transitioned_issues)
+    end
+  end
+
+  def test_transitioned_issues_is_empty_when_env_not_configured
+    issue = Issue.find(1)
+
+    merge_request =
+      MergeRequest.create!(title: "resolves ##{issue.id}", state: 'merged')
+
+    assert_equal([], merge_request.transitioned_issues)
+  end
+
+  private
+
+  def with_merge_status_env
+    vars = {
+      'REDMINE_MERGE_REQUEST_LINKS_REDMINE_USER_ID' => '2',
+      'REDMINE_MERGE_REQUEST_LINKS_AFTER_MERGE_STATUS' => 'Resolved',
+      'REDMINE_MERGE_REQUEST_LINKS_FIXING_KEYWORD_PATTERN' =>
+        '(?:clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:e[sd]?|ing))'
+    }
+    previous = {}
+    vars.each { |key, value| previous[key] = ENV[key]; ENV[key] = value }
+    yield
+  ensure
+    previous.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
   end
 end
