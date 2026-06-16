@@ -36,9 +36,17 @@ Option A(i) from the handover, dispatched from the **controller** (not the model
 The transition runs inside `MergeRequestsController#event` — a live HTTP request
 (the GitLab webhook POST) that carries **no** `X-Skip-Webhooks` header. By passing
 that request (and the controller as `controller`) into the hook context,
-`skip_webhooks` returns `false` and the webhook fires with a real `issue_url` in
-the payload — identical to a normal edit. This keeps the whole fix inside MRL with
-**no change to `redmine_webhook`**.
+`skip_webhooks` returns `false` and the webhook fires with the same payload *shape*
+a normal edit produces. This keeps the whole fix inside MRL with **no change to
+`redmine_webhook`**.
+
+Caveat on the `url` field: `controller.issue_url(issue)` builds the URL from the
+**incoming request's** host/scheme (Redmine's `ApplicationController` does not set
+`default_url_options` from `Setting.host_name`/`Setting.protocol`). Because the URL
+is generated inside the GitLab-webhook request, its host/scheme may differ from the
+public Redmine host a browser-driven edit would use (e.g. an internal hostname, or
+`http` behind a TLS-terminating proxy). The `issue` hash (with the issue id)
+is unaffected; only `url` is at risk. See verification item below.
 
 Rejected alternatives:
 - **Model dispatches (request threaded in):** smaller diff but couples the model
@@ -52,11 +60,23 @@ Rejected alternatives:
 ### Model — `app/models/merge_request.rb`
 - Keep the existing transition logic and its defensive `unless issue.save` +
   `logger.warn` (do **not** switch to `save!`: a raise would return HTTP 500 to the
-  GitLab webhook handler).
-- Add `attr_reader :transitioned_issues`.
-- In `update_mentioned_issues_status`: reset `@transitioned_issues = []` at the top
-  (so non-merge saves leave it empty), and append an issue to it only when its save
-  **succeeds**.
+  GitLab webhook handler). Note this does not make `#event` raise-proof — a
+  misconfigured `REDMINE_..._REDMINE_USER_ID` still makes `User.find` raise; that is
+  pre-existing and out of scope here.
+- Expose the transitioned issues via a reader that **always returns an array**:
+  `def transitioned_issues; @transitioned_issues ||= []; end`. This is critical —
+  the method early-returns on non-merge/blank-env saves, so a plain `attr_reader`
+  would leave `@transitioned_issues` `nil` and the controller's `.each` would raise
+  `NoMethodError`.
+- In `update_mentioned_issues_status`: append an issue only when its save
+  **succeeds** (so failed transitions are not announced). The status-only change
+  always produces a `JournalDetail`, so `issue.current_journal` is persisted for
+  every appended issue.
+
+This threads `transitioned_issues` as model instance state read by the controller
+*after* `update!` returns. That is safe here because `#event` performs exactly one
+save; if a future code path saved the same `MergeRequest` object twice, the later
+save would overwrite the list. Documented intentionally, not refactored away.
 
 ### Controller — `app/controllers/merge_requests_controller.rb`
 - After `merge_request.update!(attributes)`, loop `merge_request.transitioned_issues`
@@ -76,18 +96,31 @@ Rejected alternatives:
 - No-op when the list is empty (non-merge events, no fixing keyword, blank env).
 
 ### Resulting payload
-`{ payload: { action: "updated", issue: {...}, journal: {...}, url: "<real issue_url>" } }`
-— the same shape a normal `IssuesController#update` edit produces.
+`{ payload: { action: "updated", issue: {...}, journal: {...}, url: "<issue_url>" } }`
+— the same shape a normal `IssuesController#update` edit produces (with the `url`
+host/scheme caveat noted above). Delivery is fire-and-forget: `redmine_webhook`
+POSTs from a detached `Thread.start` and only logs on failure, so a failed delivery
+is invisible to the `#event` response (which still returns `head :ok`).
 
-## Testing
+Tests assert the **hook fires**, not the HTTP POST — the actual delivery is in a
+detached thread (untestable and would otherwise be cut off when the test process
+exits). mocha ships with Redmine's bundled test harness; `Redmine::Hook.call_hook`
+is a plain class method, trivially stubbable. Match leniently on the hook name +
+`has_entries(issue: ...)`, not the full argument hash, to avoid brittleness.
 
 - **Functional** (`test/functional/merge_requests_controller_test.rb`): on a
-  `merged` GitLab event with a fixing keyword, assert
-  `Redmine::Hook.call_hook(:controller_issues_edit_after_save, ...)` fires for the
-  fixed issue (mocha, bundled with Redmine's test harness). Negative cases:
-  `state != 'merged'` → no hook; blank env → no hook.
-- **Unit** (`test/unit/merge_request_test.rb`): assert `transitioned_issues` is
-  populated on a merged-with-keyword save and empty otherwise.
+  `merged` GitLab event with a fixing keyword, assert `call_hook` fires with
+  `:controller_issues_edit_after_save` for the fixed issue. Cases:
+  - single fixed issue → one hook call;
+  - **multiple** fixed issues → one hook call per issue (guards the per-save reset
+    / aliasing logic);
+  - same issue mentioned twice → exactly one hook call (already deduped via `.uniq`);
+  - `state != 'merged'` → no hook call;
+  - blank env (`REDMINE_..._AFTER_MERGE_STATUS` unset) → no hook call.
+- **Unit** (`test/unit/merge_request_test.rb`): on a merged-with-keyword save,
+  assert `transitioned_issues` contains the issue **and** its `current_journal` is
+  `persisted?` (status-only change creates a `JournalDetail`); assert
+  `transitioned_issues == []` (never `nil`) on a non-merge save and a blank-env save.
 - Keep existing behavior green: keyword vs. plain-mention issue selection, the
   `state != 'merged'` no-op, and the blank-env no-op.
 
@@ -98,3 +131,7 @@ Rejected alternatives:
 - Deploy to `redmine-test` and end-to-end verification (handover §8).
 - Confirming the target project actually has a `Webhook` row configured — a correct
   fix still posts nothing if the consumer side is unconfigured (handover §9).
+- Verifying the `url` host/scheme: compare the GitLab webhook endpoint host against
+  the public Redmine host. If the Jira↔Redmine sync relies on `url` (not just the
+  issue id), either align the endpoint host or set `default_url_options` so the
+  payload URL is browser-usable.
