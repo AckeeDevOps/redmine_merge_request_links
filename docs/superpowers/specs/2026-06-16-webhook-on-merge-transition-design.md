@@ -124,6 +124,44 @@ is a plain class method, trivially stubbable. Match leniently on the hook name +
 - Keep existing behavior green: keyword vs. plain-mention issue selection, the
   `state != 'merged'` no-op, and the blank-env no-op.
 
+## Manual verification on redmine-test (no test GitLab available)
+
+There is no test GitLab wired to the test Redmine (prod GitLab only). That's fine —
+`/merge_requests/event` is a token-guarded HTTP endpoint, so the "merged" webhook is
+forged with `curl`. **Variant 2 means the dispatch happens in the controller, so the
+test must go through the HTTP endpoint** — a Rails-console `MergeRequest.update!`
+would transition the issue but would NOT fire the webhook.
+
+Prereqs on `redmine-test` (after deploying the fixed plugin per handover §8):
+- Env vars: `REDMINE_..._REDMINE_USER_ID=440`, `..._AFTER_MERGE_STATUS=Test ready`,
+  `..._FIXING_KEYWORD_PATTERN=<regex>`, `..._GITLAB_WEBHOOK_TOKEN=<token>` (token is
+  plain-text in the Helm template, §5).
+- A target issue `#<ISSUE_ID>` in a project. No workflow permission needed for user
+  440 — the direct `issue.status = ...; issue.save` bypasses workflow checks.
+- A `Webhook` row for that project (or `project_id: 0`) pointing at a capture URL
+  (e.g. `webhook.site`). The pod needs egress to reach it, else use an in-cluster
+  listener.
+
+Forge the merged event (body matches `event_handlers/gitlab.rb` — top-level
+`user.username` **and** `object_attributes`, fixing keyword referencing the issue):
+
+```bash
+curl -i -X POST https://redmine-upgrade.ack.ee/merge_requests/event \
+  -H 'X-Gitlab-Event: Merge Request Hook' \
+  -H "X-Gitlab-Token: $TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"user":{"username":"merge-bot"},"object_attributes":{"url":"https://gitlab.ack.ee/test/project/-/merge_requests/999","title":"resolves #<ISSUE_ID>","description":"resolves #<ISSUE_ID>","state":"merged","iid":999,"target":{"path_with_namespace":"test/project"}}}'
+```
+
+(or `kubectl port-forward deploy/redmine-test 8080:3000` and POST to
+`http://localhost:8080/merge_requests/event` to avoid exposing the token).
+
+Verify: (1) issue `#<ISSUE_ID>` moved to **Test ready** with a journal by user 440;
+(2) the capture endpoint received `{"payload":{"action":"updated","issue":{…},
+"journal":{…},"url":"…"}}`; (3) re-sending with `state: "opened"` or no keyword
+moves nothing and fires nothing. The payload `url` host reflects whatever host you
+POSTed to (the `issue_url` caveat above).
+
 ## Out of scope (tracked separately)
 
 - Reconciling the prod baseline (`db75482` + uncommitted zeitwerk shims) and the
