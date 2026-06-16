@@ -16,6 +16,13 @@ class MergeRequest < ActiveRecord::Base
     includes(:issues).where(issues: { id: issue.id })
   end
 
+  # Issues whose status was successfully transitioned by the most recent save.
+  # Always an array, even when the merge-status transition did not run, so
+  # callers can iterate it unconditionally.
+  def transitioned_issues
+    @transitioned_issues ||= []
+  end
+
   private
 
   ISSUE_ID_REGEXP = /(?:[^a-z]|\A)(?:#|REDMINE-)(\d+)/
@@ -43,18 +50,21 @@ class MergeRequest < ActiveRecord::Base
     redmine_user_id = ENV['REDMINE_MERGE_REQUEST_LINKS_REDMINE_USER_ID']
     after_merge_status = ENV['REDMINE_MERGE_REQUEST_LINKS_AFTER_MERGE_STATUS']
     fixing_pattern = ENV['REDMINE_MERGE_REQUEST_LINKS_FIXING_KEYWORD_PATTERN']
+    @transitioned_issues = []
     if state != 'merged' || redmine_user_id.blank? || after_merge_status.blank?
       return
     end
     issue_ids = fixing_pattern.present? ? fixed_issue_ids(fixing_pattern) : mentioned_issue_ids
-    issue_ids.map do |match|
+    issue_ids.each do |match|
       issue = Issue.find_by_id(match[0])
-      if issue.present?
-        issue.init_journal(User.find(redmine_user_id))
-        issue.status = IssueStatus.find_by_name(after_merge_status)
-        unless issue.save
-          logger.warn("Issue ##{issue.id} could not be saved by merge request") if logger
-        end
+      next unless issue.present?
+
+      issue.init_journal(User.find(redmine_user_id))
+      issue.status = IssueStatus.find_by_name(after_merge_status)
+      if issue.save
+        @transitioned_issues << issue
+      elsif logger
+        logger.warn("Issue ##{issue.id} could not be saved by merge request")
       end
     end
   end

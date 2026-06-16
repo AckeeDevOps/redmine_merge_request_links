@@ -1,14 +1,30 @@
 require File.expand_path('../../test_helper', __FILE__)
 
+# Real listener that records :controller_issues_edit_after_save dispatches, so
+# we can assert the controller fires the webhook hook without stubbing
+# Redmine::Hook.call_hook itself (stubbing it globally would poison Redmine's
+# own legitimate call_hook usage — e.g. the issue-edit mailer rendered when the
+# transition saves a journal). Returns '' to match the real hook contract.
+class IssueWebhookHookSpy < Redmine::Hook::Listener
+  cattr_accessor :captured
+  self.captured = []
+
+  def controller_issues_edit_after_save(context = {})
+    self.class.captured << context
+    ''
+  end
+end
+
 class MergeRequestsControllerTest < ActionController::TestCase
   include RedmineMergeRequestLinks::RequestTestHelperCompat
 
   TOKEN = 'secret'
   MERGE_REQUEST_URL = 'https://gitlab.example.com/project/merge_requests/1'
 
-  fixtures :issues
+  fixtures :all
 
   def setup
+    IssueWebhookHookSpy.captured = []
     RedmineMergeRequestLinks.event_handlers = [
       RedmineMergeRequestLinks::EventHandlers::Gitea.new(token: TOKEN),
       RedmineMergeRequestLinks::EventHandlers::Github.new(token: TOKEN),
@@ -513,7 +529,104 @@ class MergeRequestsControllerTest < ActionController::TestCase
     assert_response :bad_request
   end
 
+  def test_fires_webhook_when_merged_with_fixing_keyword
+    issue = Issue.find(1)
+
+    with_merge_status_env do
+      post_gitlab_merge_event(title: "resolves ##{issue.id}")
+
+      assert_response :success
+      assert_equal('Resolved', issue.reload.status.name)
+
+      assert_equal(1, IssueWebhookHookSpy.captured.size)
+      context = IssueWebhookHookSpy.captured.first
+      assert_equal(issue, context[:issue])
+      # request + controller must be present so redmine_webhook's skip_webhooks
+      # does not suppress the post.
+      assert_instance_of(MergeRequestsController, context[:controller])
+      assert_not_nil(context[:request])
+      assert(context[:journal].present? && context[:journal].persisted?,
+             'expected a persisted journal in the hook context')
+    end
+  end
+
+  def test_fires_webhook_for_each_fixed_issue
+    issue_one = Issue.find(1)
+    issue_two = Issue.find(2)
+
+    with_merge_status_env do
+      post_gitlab_merge_event(title: "resolves ##{issue_one.id}",
+                              description: "also resolves ##{issue_two.id}")
+
+      assert_response :success
+
+      captured_issues = IssueWebhookHookSpy.captured.map { |context| context[:issue] }
+      assert_equal([issue_one, issue_two].sort_by(&:id),
+                   captured_issues.sort_by(&:id))
+    end
+  end
+
+  def test_fires_webhook_once_when_same_issue_mentioned_twice
+    issue = Issue.find(1)
+
+    with_merge_status_env do
+      post_gitlab_merge_event(title: "resolves ##{issue.id}",
+                              description: "resolves ##{issue.id} again")
+
+      assert_response :success
+      assert_equal(1, IssueWebhookHookSpy.captured.size)
+    end
+  end
+
+  def test_does_not_fire_webhook_when_not_merged
+    issue = Issue.find(1)
+
+    with_merge_status_env do
+      post_gitlab_merge_event(title: "resolves ##{issue.id}", state: 'opened')
+
+      assert_response :success
+      assert_empty(IssueWebhookHookSpy.captured)
+    end
+  end
+
+  def test_does_not_fire_webhook_when_status_env_blank
+    issue = Issue.find(1)
+
+    post_gitlab_merge_event(title: "resolves ##{issue.id}")
+
+    assert_response :success
+    assert_empty(IssueWebhookHookSpy.captured)
+  end
+
   private
+
+  def post_gitlab_merge_event(title:, state: 'merged', description: nil)
+    request.headers['X-Gitlab-Event'] = 'Merge Request Hook'
+    request.headers['X-Gitlab-Token'] = TOKEN
+    attributes = {
+      url: MERGE_REQUEST_URL,
+      title: title,
+      state: state,
+      iid: 23,
+      target: { path_with_namespace: 'group/project' }
+    }
+    attributes[:description] = description unless description.nil?
+    post(:event, user: { username: 'john' }, object_attributes: attributes)
+  end
+
+  def with_merge_status_env
+    vars = {
+      'REDMINE_MERGE_REQUEST_LINKS_REDMINE_USER_ID' => '2',
+      'REDMINE_MERGE_REQUEST_LINKS_AFTER_MERGE_STATUS' => 'Resolved',
+      'REDMINE_MERGE_REQUEST_LINKS_FIXING_KEYWORD_PATTERN' =>
+        '(?:clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:e[sd]?|ing))'
+    }
+    previous = {}
+    vars.each { |key, value| previous[key] = ENV[key]; ENV[key] = value }
+    yield
+  ensure
+    previous.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
+  end
 
   def hub_signature(payload)
     'sha1=' + OpenSSL::HMAC.hexdigest(OpenSSL::Digest.new('sha1'),
