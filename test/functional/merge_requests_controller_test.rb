@@ -1,10 +1,26 @@
 require File.expand_path('../../test_helper', __FILE__)
 
-# Real listener that records :controller_issues_edit_after_save dispatches, so
-# we can assert the controller fires the webhook hook without stubbing
-# Redmine::Hook.call_hook itself (stubbing it globally would poison Redmine's
-# own legitimate call_hook usage — e.g. the issue-edit mailer rendered when the
-# transition saves a journal). Returns '' to match the real hook contract.
+# Stand-in for redmine_webhook's listener (a Singleton, like the real
+# RedmineWebhook::WebhookListener). The controller dispatches the webhook by
+# calling THIS listener directly — not via Redmine::Hook.call_hook — so that
+# only redmine_webhook reacts and co-listeners on the shared
+# controller_issues_edit_after_save hook (e.g. redmine_checklists, which needs
+# IssuesController-only state) are not dragged in and crashed.
+module RedmineWebhook
+  class WebhookListener < Redmine::Hook::Listener
+    cattr_accessor :captured
+    self.captured = []
+
+    def controller_issues_edit_after_save(context = {})
+      self.class.captured << context
+      ''
+    end
+  end
+end
+
+# Generic listener registered on the shared hook. If the controller ever went
+# back to broadcasting via call_hook, this would record — so an empty capture
+# proves the dispatch stayed targeted.
 class IssueWebhookHookSpy < Redmine::Hook::Listener
   cattr_accessor :captured
   self.captured = []
@@ -25,6 +41,7 @@ class MergeRequestsControllerTest < ActionController::TestCase
 
   def setup
     IssueWebhookHookSpy.captured = []
+    RedmineWebhook::WebhookListener.captured = []
     RedmineMergeRequestLinks.event_handlers = [
       RedmineMergeRequestLinks::EventHandlers::Gitea.new(token: TOKEN),
       RedmineMergeRequestLinks::EventHandlers::Github.new(token: TOKEN),
@@ -529,7 +546,7 @@ class MergeRequestsControllerTest < ActionController::TestCase
     assert_response :bad_request
   end
 
-  def test_fires_webhook_when_merged_with_fixing_keyword
+  def test_dispatches_webhook_to_redmine_webhook_listener_on_merge
     issue = Issue.find(1)
 
     with_merge_status_env do
@@ -538,19 +555,23 @@ class MergeRequestsControllerTest < ActionController::TestCase
       assert_response :success
       assert_equal('Resolved', issue.reload.status.name)
 
-      assert_equal(1, IssueWebhookHookSpy.captured.size)
-      context = IssueWebhookHookSpy.captured.first
+      # Dispatched directly to redmine_webhook's listener...
+      assert_equal(1, RedmineWebhook::WebhookListener.captured.size)
+      context = RedmineWebhook::WebhookListener.captured.first
       assert_equal(issue, context[:issue])
       # request + controller must be present so redmine_webhook's skip_webhooks
       # does not suppress the post.
       assert_instance_of(MergeRequestsController, context[:controller])
       assert_not_nil(context[:request])
       assert(context[:journal].present? && context[:journal].persisted?,
-             'expected a persisted journal in the hook context')
+             'expected a persisted journal in the dispatch context')
+
+      # ...and NOT broadcast via call_hook to co-listeners on the shared hook.
+      assert_empty(IssueWebhookHookSpy.captured)
     end
   end
 
-  def test_fires_webhook_for_each_fixed_issue
+  def test_dispatches_webhook_for_each_fixed_issue
     issue_one = Issue.find(1)
     issue_two = Issue.find(2)
 
@@ -560,13 +581,13 @@ class MergeRequestsControllerTest < ActionController::TestCase
 
       assert_response :success
 
-      captured_issues = IssueWebhookHookSpy.captured.map { |context| context[:issue] }
-      assert_equal([issue_one, issue_two].sort_by(&:id),
-                   captured_issues.sort_by(&:id))
+      dispatched = RedmineWebhook::WebhookListener.captured.map { |c| c[:issue] }
+      assert_equal([issue_one, issue_two].sort_by(&:id), dispatched.sort_by(&:id))
+      assert_empty(IssueWebhookHookSpy.captured)
     end
   end
 
-  def test_fires_webhook_once_when_same_issue_mentioned_twice
+  def test_dispatches_webhook_once_when_same_issue_mentioned_twice
     issue = Issue.find(1)
 
     with_merge_status_env do
@@ -574,28 +595,28 @@ class MergeRequestsControllerTest < ActionController::TestCase
                               description: "resolves ##{issue.id} again")
 
       assert_response :success
-      assert_equal(1, IssueWebhookHookSpy.captured.size)
+      assert_equal(1, RedmineWebhook::WebhookListener.captured.size)
     end
   end
 
-  def test_does_not_fire_webhook_when_not_merged
+  def test_does_not_dispatch_webhook_when_not_merged
     issue = Issue.find(1)
 
     with_merge_status_env do
       post_gitlab_merge_event(title: "resolves ##{issue.id}", state: 'opened')
 
       assert_response :success
-      assert_empty(IssueWebhookHookSpy.captured)
+      assert_empty(RedmineWebhook::WebhookListener.captured)
     end
   end
 
-  def test_does_not_fire_webhook_when_status_env_blank
+  def test_does_not_dispatch_webhook_when_status_env_blank
     issue = Issue.find(1)
 
     post_gitlab_merge_event(title: "resolves ##{issue.id}")
 
     assert_response :success
-    assert_empty(IssueWebhookHookSpy.captured)
+    assert_empty(RedmineWebhook::WebhookListener.captured)
   end
 
   private
